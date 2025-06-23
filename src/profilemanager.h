@@ -8,8 +8,9 @@
 #include <QList>
 
 // Forward declaration for the worker class that will handle ttcoreex
-class MudEngineWorker;
-class QThread;
+class MudEngineWorker; // Actual include will be in .cpp
+class QThread;         // Actual include will be in .cpp
+
 
 /**
  * @brief The ProfileManager class is responsible for managing MUD profiles, settings,
@@ -70,6 +71,16 @@ public:
     void setKeywords(const QStringList& keywords);
     void setCommandChar(wchar_t commandChar);
 
+    // Accessors for InputBarWidget global settings
+    int getInputHistorySize() const;
+    bool getClearInputAfterSend() const;
+    bool getInputBarTokenInput() const;
+    bool getInputBarKillOneToken() const;
+    bool getInputBarScrollEnd() const;
+    int getInputBarCursorPosWhileListing() const;
+    int getInputBarMinStrLenForHistory() const;
+    bool getAllowScriptDebug() const; // Also a global setting
+
 
 signals:
     void profileLoaded(const QString& profileName);
@@ -85,6 +96,8 @@ signals:
 public slots:
     void sendCommandToMud(const QString& command); // User input from InputBarWidget
     void reloadScripts(); // Triggered by menu action
+    void breakActiveScript(); // Triggered by menu action
+    void launchActiveScriptDebugger(); // Triggered by menu action
 
 private slots:
     // Slots to receive signals from MudEngineWorker
@@ -175,6 +188,15 @@ private:
     // Helpers to convert between MFC profile path logic and Qt absolute paths
     QString makeAbsolutePath(const QString& relativeOrAbsoluteFile, const QString& baseDir);
     QString makeLocalPath(const QString& absoluteFile, const QString& baseDir);
+
+    // Command History
+    QStringList m_commandHistory;
+    void loadCommandHistory(); // Loads from m_globalSettings
+    void saveCommandHistory(); // Saves to m_globalSettings
+
+public: // Public accessors for history for MainWindow/InputBarWidget
+    QStringList getCommandHistory() const;
+    void setCommandHistory(const QStringList& history); // For InputBar to update before saving
 };
 
 #endif // PROFILEMANAGER_H

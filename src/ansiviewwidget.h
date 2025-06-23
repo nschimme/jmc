@@ -118,12 +118,13 @@ private:
     void updateMetrics();        // Recalculate m_charAvgWidth, m_lineHeight based on font
     void rebuildScreenLines();   // Re-calculates m_screenLines based on m_scrollbackBuffer and wrapping
     void updateScrollbarRange();
+    QString stripAnsiCodes(const QString& textWithAnsi) const; // Helper for length calculation and plain text copy
 
     // Core drawing routine for a single logical line from buffer, handles wrapping
-    void drawLogicalLine(QPainter& painter, int bufferIndex, int& currentY);
+    // void drawLogicalLine(QPainter& painter, int bufferIndex, int& currentY); // To be replaced/rethought
     // Helper to draw a segment of text with specific attributes
-    int drawTextSegment(QPainter& painter, int x, int y, const QString& text,
-                         const QColor& fg, const QColor& bg, bool bold, bool isSelectedSegment);
+    // int drawTextSegment(QPainter& painter, int x, int y, const QString& text,
+    //                      const QColor& fg, const QColor& bg, bool bold, bool isSelectedSegment); // This will be part of paintEvent's loop
     void applyAnsiCode(const QString& ansiSequence); // Updates m_currentFgColor, etc.
 
     QPoint mapPointToBufferCoordinates(const QPoint& widgetPoint, int& bufferLineIndex, int& charIndexInLine) const;

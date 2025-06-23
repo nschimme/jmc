@@ -3,7 +3,10 @@
 #include <QDebug>
 #include <QStandardPaths>
 #include <QDir>
-#include <QCoreApplication> // For applicationDirPath if not using QStandardPaths
+#include <QCoreApplication>
+#include <QThread>
+#include "mudengineworker.h" // Now include the full definition
+
 
 // Default ANSI Colors (similar to CSmcDoc::DefColors)
 // These will be used if no colors are found in settings.
@@ -59,19 +62,25 @@ ProfileManager::ProfileManager(QObject *parent)
         }
     }
     qDebug() << "ProfileManager created. Initial profile attempt:" << m_currentProfileName;
+
+    loadCommandHistory(); // Load global command history
+    startMudEngineThread(); // Start the worker thread
 }
 
 ProfileManager::~ProfileManager()
 {
+    // stopMudEngineThread(); // Call this first to ensure worker is stopped
+    saveCommandHistory();   // Save history before settings objects are deleted
     saveGlobalSettings(); // Save last profile name etc.
+
     if (m_profileSettings) {
-        // No explicit saveProfileSpecificSettings() here, as it's usually tied to "Save Profile" action
         delete m_profileSettings;
+        m_profileSettings = nullptr;
     }
     if (m_globalSettings) {
         delete m_globalSettings;
+        m_globalSettings = nullptr;
     }
-    // stopMudEngineThread(); // Implement later
     qDebug() << "ProfileManager destroyed";
 }
 
@@ -496,7 +505,201 @@ void ProfileManager::reloadScripts() {
     // 3. Reading other script files defined in JMC objects
     // 4. Concatenating them
     // 5. Sending to MudEngineWorker to reload script engine
+
+    startMudEngineThread(); // Start the worker thread after profile is loaded/initialized
 }
+
+void ProfileManager::startMudEngineThread() {
+    if (m_workerThread && m_workerThread->isRunning()) {
+        qWarning() << "MudEngineWorker thread already running.";
+        return;
+    }
+
+    if (!m_workerThread) {
+        m_workerThread = new QThread(this); // Parent to ProfileManager for auto-cleanup if PM is deleted
+    }
+    if (!m_mudEngineWorker) {
+        m_mudEngineWorker = new MudEngineWorker(); // No parent, will be moved to thread
+    }
+
+    m_mudEngineWorker->moveToThread(m_workerThread);
+
+    // Connect signals for thread management
+    connect(m_workerThread, &QThread::started, m_mudEngineWorker, [this](){
+        qDebug() << "MudEngineWorker thread started. Worker preparing to initialize.";
+        // Pass a WId. For now, 0, as ttcoreex might not need a real HWND if callbacks are function pointers.
+        // A more robust way would be for MainWindow to provide its winId().
+        WId mainWindowId = 0; // Placeholder
+        QMetaObject::invokeMethod(m_mudEngineWorker, "initializeEngine", Qt::QueuedConnection, Q_ARG(WId, mainWindowId));
+    });
+    connect(m_mudEngineWorker, &MudEngineWorker::finished, m_workerThread, &QThread::quit);
+    connect(m_mudEngineWorker, &MudEngineWorker::finished, m_mudEngineWorker, &MudEngineWorker::deleteLater); // Worker cleans itself up
+    connect(m_workerThread, &QThread::finished, m_workerThread, &QThread::deleteLater); // Thread cleans itself up
+    // If worker is deleted, and thread is still parented to ProfileManager, then thread might not be deleted by deleteLater if PM is deleted first.
+    // Better: connect(m_workerThread, &QThread::finished, this, [this](){ m_workerThread = nullptr; m_mudEngineWorker = nullptr; });
+
+
+    // Connect communication signals
+    // ProfileManager -> MudEngineWorker (command sending is via invokeMethod)
+    // MudEngineWorker -> ProfileManager
+    connect(m_mudEngineWorker, &MudEngineWorker::textReceived, this, &ProfileManager::onTextReceivedFromWorker);
+    connect(m_mudEngineWorker, &MudEngineWorker::clearDisplayRequested, this, &ProfileManager::onClearDisplayFromWorker);
+    connect(m_mudEngineWorker, &MudEngineWorker::errorOccurred, this, [this](const QString& errorString){
+        qWarning() << "Error from MudEngineWorker:" << errorString;
+        // Optionally emit another signal for the UI to display this error
+    });
+
+
+    m_workerThread->start();
+    qDebug() << "MudEngineWorker thread start requested.";
+}
+
+void ProfileManager::stopMudEngineThread() {
+    if (m_workerThread && m_workerThread->isRunning() && m_mudEngineWorker) {
+        qDebug() << "Requesting MudEngineWorker to stop...";
+        // Signal the worker to quit its operations.
+        // The worker should handle this by stopping loops and emitting finished().
+        // For now, we directly invoke quit on its thread if it has a #quit command,
+        // or we can add a specific quit slot to MudEngineWorker.
+        // If MudEngineWorker::processCommand handles "#quit" by emitting finished(), that's one way.
+        // Alternatively:
+        // QMetaObject::invokeMethod(m_mudEngineWorker, "quitSafely", Qt::QueuedConnection);
+        // Then MudEngineWorker::quitSafely() would set a flag and emit finished().
+
+        // For now, assuming a #quit command or similar will make it emit finished().
+        // If not, the thread needs to be quit more directly.
+        m_workerThread->quit(); // Ask the event loop to exit
+        if (!m_workerThread->wait(3000)) { // Wait up to 3 seconds
+            qWarning() << "MudEngineWorker thread did not quit gracefully, terminating...";
+            m_workerThread->terminate();
+            m_workerThread->wait(); // Wait for termination
+        } else {
+            qDebug() << "MudEngineWorker thread finished gracefully.";
+        }
+    }
+    // Objects should be cleaned up by deleteLater connections.
+    // Nullify pointers to prevent reuse if ProfileManager itself isn't being destroyed.
+    // If ProfileManager is being destroyed, QObject parenting handles some of this.
+    m_mudEngineWorker = nullptr;
+    m_workerThread = nullptr;
+}
+
+void ProfileManager::sendCommandToMud(const QString& command)
+{
+    if (m_mudEngineWorker && m_workerThread && m_workerThread->isRunning()) {
+        // Use QMetaObject::invokeMethod to ensure processCommand is called in the worker's thread
+        bool success = QMetaObject::invokeMethod(m_mudEngineWorker, "processCommand", Qt::QueuedConnection,
+                                     Q_ARG(QString, command));
+        if (!success) {
+            qWarning() << "Failed to invoke processCommand on MudEngineWorker.";
+        } else {
+            qDebug() << "Command queued for MudEngineWorker:" << command;
+        }
+    } else {
+        qWarning() << "Mud engine worker not running. Command not sent:" << command;
+        // Optionally, echo to main view that engine is not active
+        emit textAddedToBuffer(0, "[System: MUD Engine not active. Command not sent: " + command + "]");
+    }
+}
+
+// Slots for MudEngineWorker signals (to be implemented when MudEngineWorker is)
+void ProfileManager::onTextReceivedFromWorker(int wndCode, const QString& text) {
+    qDebug() << "ProfileManager::onTextReceivedFromWorker - WndCode:" << wndCode << "Text:" << text;
+    // Process text if needed (e.g. timestamping if not done by view)
+    emit textAddedToBuffer(wndCode, text);
+}
+
+void ProfileManager::onClearDisplayFromWorker(int wndCode) {
+    qDebug() << "ProfileManager::onClearDisplayFromWorker - WndCode:" << wndCode;
+    emit bufferCleared(wndCode);
+}
+
+void ProfileManager::reloadScripts() {
+    qDebug() << "ProfileManager::reloadScripts() called.";
+    if (m_mudEngineWorker && m_workerThread && m_workerThread->isRunning()) {
+        // TODO: Gather all script text as in CSmcDoc::OnScriptingReload
+        QString allScriptText = "// Placeholder for combined scripts from commonlib.scr, profile.scr, etc.";
+        // QByteArray langGuid; // If needed for script engine
+        // QMetaObject::invokeMethod(m_mudEngineWorker, "reloadScripts", Qt::QueuedConnection,
+        //                           Q_ARG(QString, allScriptText), Q_ARG(QByteArray, langGuid));
+        qDebug() << "Reload scripts command would be queued for MudEngineWorker.";
+        emit textAddedToBuffer(0, "[System: Script reload requested (not fully implemented).]");
+
+    } else {
+        qWarning() << "Mud engine worker not running. Cannot reload scripts.";
+        emit textAddedToBuffer(0, "[System: MUD Engine not active. Cannot reload scripts.]");
+    }
+    // This would involve:
+    // 1. Reading commonlib.scr
+    // 2. Reading profile-specific .scr file
+    // 3. Reading other script files defined in JMC objects
+    // 4. Concatenating them
+    // 5. Sending to MudEngineWorker to reload script engine
+}
+
+
+// --- Command History Management ---
+void ProfileManager::loadCommandHistory() {
+    if (m_globalSettings) {
+        m_commandHistory = m_globalSettings->value("History/entries").toStringList();
+        // Max history size is m_inputHistorySize, which is also loaded from global settings.
+        // We'll let InputBarWidget primarily manage trimming to this size when it loads the history.
+        // However, we can do a preliminary trim here too.
+        int maxHist = m_inputHistorySize; // getInputHistorySize() isn't const, m_inputHistorySize is available
+        if (maxHist <= 0) maxHist = 20; // Fallback if not loaded yet or invalid
+
+        while(m_commandHistory.size() > maxHist) {
+            m_commandHistory.removeFirst();
+        }
+        qDebug() << "Loaded" << m_commandHistory.size() << "command history entries. Max size:" << maxHist;
+    } else {
+        qWarning() << "Global settings not available, cannot load command history.";
+    }
+}
+
+void ProfileManager::saveCommandHistory() {
+    if (m_globalSettings) {
+        // InputBarWidget is the source of truth for current history during session.
+        // ProfileManager's m_commandHistory should be updated from InputBarWidget before saving.
+        // This is handled by MainWindow calling setCommandHistory before triggering global save.
+        int maxHist = m_inputHistorySize;
+        if (maxHist <= 0) maxHist = 20;
+
+        while(m_commandHistory.size() > maxHist) {
+            m_commandHistory.removeFirst(); // Trim if it somehow grew too large
+        }
+        m_globalSettings->setValue("History/entries", m_commandHistory);
+        qDebug() << "Saved" << m_commandHistory.size() << "command history entries to jmc.ini.";
+    } else {
+        qWarning() << "Global settings not available, cannot save command history.";
+    }
+}
+
+QStringList ProfileManager::getCommandHistory() const {
+    return m_commandHistory;
+}
+
+void ProfileManager::setCommandHistory(const QStringList& history) {
+    m_commandHistory = history;
+    // Optionally, trim again here if rules are strict, though InputBarWidget should also manage its size.
+    int maxHist = m_inputHistorySize;
+    if (maxHist <= 0) maxHist = 20; // Fallback
+
+    while(m_commandHistory.size() > maxHist) {
+        m_commandHistory.removeFirst();
+    }
+}
+
+
+// --- Getters for InputBarWidget global settings ---
+int ProfileManager::getInputHistorySize() const { return m_inputHistorySize; }
+bool ProfileManager::getClearInputAfterSend() const { return m_clearInputAfterSend; }
+bool ProfileManager::getInputBarTokenInput() const { return m_inputBarTokenInput; }
+bool ProfileManager::getInputBarKillOneToken() const { return m_inputBarKillOneToken; }
+bool ProfileManager::getInputBarScrollEnd() const { return m_inputBarScrollEnd; }
+int ProfileManager::getInputBarCursorPosWhileListing() const { return m_inputBarCursorPosWhileListing; }
+int ProfileManager::getInputBarMinStrLenForHistory() const { return m_inputBarMinStrLenForHistory; }
+bool ProfileManager::getAllowScriptDebug() const { return m_bAllowScriptDebug; }
 
 void ProfileManager::createNewProfile(const QString& newName, bool copyCurrentSettingsFrom, const QString& sourceProfileName)
 {

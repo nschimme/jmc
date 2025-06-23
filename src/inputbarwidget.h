@@ -56,6 +56,8 @@ public:
     void setTokenInputOptions(bool enabled, bool killOneToken);
     void setCursorAtEndForHistoryRecall(bool atEnd);
     void setScrollEndOnSend(bool scrollEnd);
+    void setProfileManager(ProfileManager* manager); // To fetch settings
+
     // Method to load history from ProfileManager (e.g. on profile switch)
     void loadHistory(const QStringList& history);
     QStringList getHistory() const; // To save history via ProfileManager
@@ -79,6 +81,7 @@ private:
     QLineEdit* m_inputEdit;
     // QCompleter* m_completer; // Standard Qt completer, might use if custom logic is too complex
     QStringListModel* m_keywordModelForCompleter; // Data model for keywords if using QCompleter
+    ProfileManager* m_profileManager; // Pointer to access global settings
 
     QStringList m_history;      // Command history buffer
     int m_historyIndex;         // Current position when navigating history (-1 or m_history.size() if on new line)

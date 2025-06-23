@@ -81,6 +81,102 @@ void InputBarWidget::updateKeywords(const QStringList& keywords)
     qDebug() << "InputBarWidget keywords updated, count:" << keywords.size();
 }
 
+// --- Configuration & ProfileManager Interaction ---
+void InputBarWidget::setProfileManager(ProfileManager* manager)
+{
+    m_profileManager = manager;
+    if (m_profileManager) {
+        applySettingsFromProfileManager(); // Now uses the member
+        // TODO: Connect to signals from ProfileManager if InputBarWidget needs to react to live changes
+        // of global settings that affect it. Keywords are already handled by updateKeywords slot.
+    } else {
+        // Reset to default settings if ProfileManager is removed or null
+        setHistorySize(100); // Default
+        setMinStrLenForHistory(1); // Default
+        setClearInputOnSend(true); // Default
+        setTokenInputOptions(false, false); // Default
+        setCursorAtEndForHistoryRecall(true); // Default
+        setScrollEndOnSend(true); // Default
+    }
+}
+
+void InputBarWidget::applySettingsFromProfileManager()
+{
+    if (!m_profileManager) return;
+
+    setHistorySize(m_profileManager->getInputHistorySize());
+    setMinStrLenForHistory(m_profileManager->getInputBarMinStrLenForHistory());
+    setClearInputOnSend(m_profileManager->getClearInputAfterSend());
+    setTokenInputOptions(
+        m_profileManager->getInputBarTokenInput(),
+        m_profileManager->getInputBarKillOneToken()
+    );
+    setCursorAtEndForHistoryRecall(m_profileManager->getInputBarCursorPosWhileListing() != 0); // 0 was cursor at start
+    setScrollEndOnSend(m_profileManager->getInputBarScrollEnd());
+
+    // Keywords are updated via the updateKeywords() slot.
+    // History list itself is managed via loadHistory() / getHistory().
+    // Font could also be set here if InputBarWidget should use the main MUD font.
+    // setFont(profileManager->getCurrentFont());
+}
+
+// --- Public Setters for Configuration Options ---
+void InputBarWidget::setHistorySize(int size) {
+    m_maxHistorySize = qMax(1, size); // Ensure at least 1
+    while(m_history.size() > m_maxHistorySize) {
+        m_history.removeFirst();
+    }
+    // Adjust historyIndex if it's now out of new bounds
+    if (m_historyIndex >= m_history.size()) {
+        m_historyIndex = m_history.isEmpty() ? -1 : m_history.size() -1;
+         if (m_historyIndex == -1 && !m_currentTypedText.isEmpty()) { // If was navigating and now at current line
+            // setText(m_currentTypedText); // This might be too aggressive, depends on desired UX
+        } else if (m_historyIndex != -1) {
+            // setText(m_history.at(m_historyIndex));
+        } else {
+            // setText(m_currentTypedText); // Or clear if currentTypedText is empty
+        }
+    }
+}
+
+void InputBarWidget::setMinStrLenForHistory(int length) {
+    m_minStrLenForHistory = qMax(0, length);
+}
+
+void InputBarWidget::setClearInputOnSend(bool clear) {
+    m_bClearInputOnSend = clear;
+}
+
+void InputBarWidget::setTokenInputOptions(bool enabled, bool killOneToken) {
+    m_bTokenInput = enabled;
+    m_bKillOneToken = killOneToken;
+}
+
+void InputBarWidget::setCursorAtEndForHistoryRecall(bool atEnd) {
+    m_bCursorAtEndForHistoryRecall = atEnd;
+}
+
+void InputBarWidget::setScrollEndOnSend(bool scrollEnd) {
+    m_bScrollEndOnSend = scrollEnd;
+}
+
+// --- History Management Methods ---
+void InputBarWidget::loadHistory(const QStringList& history) {
+    m_history = history;
+    m_historyIndex = -1; // Reset navigation to point to current line
+    m_currentTypedText.clear(); // Clear any remembered typed text
+    // Ensure history does not exceed max size (might happen if max size changed before loading)
+    while(m_history.size() > m_maxHistorySize) {
+        m_history.removeFirst();
+    }
+}
+
+QStringList InputBarWidget::getHistory() const {
+    return m_history;
+}
+
+
+// --- Event Handling & Core Logic ---
 bool InputBarWidget::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == m_inputEdit && event->type() == QEvent::KeyPress) {
@@ -171,32 +267,68 @@ void InputBarWidget::navigateHistory(bool goUp)
 {
     if (m_history.isEmpty()) return;
 
-    if (m_historyIndex == -1) { // Was not navigating, store current text
-        // m_currentTypedText = m_inputEdit->text(); // Store only if using masked scroll
-        m_historyIndex = m_history.size(); // Start from end for 'up'
+    if (m_historyIndex == -1) { // Starting navigation
+        m_currentTypedText = m_inputEdit->text(); // Store current line for masked scroll and returning to it
+        if (goUp) {
+            m_historyIndex = m_history.size() -1; // Start from the last item
+        } else { // Down pressed on current line - do nothing or clear if desired
+            return; // Or perhaps clear m_currentTypedText and m_inputEdit, but JMC likely did nothing
+        }
+    } else { // Already navigating
+        if (goUp) {
+            m_historyIndex--;
+        } else {
+            m_historyIndex++;
+        }
     }
 
-    if (goUp) {
-        if (m_historyIndex > 0) {
-            m_historyIndex--;
-            m_inputEdit->setText(m_history.at(m_historyIndex));
+    // Apply masked scroll if m_currentTypedText is not empty
+    if (!m_currentTypedText.isEmpty()) {
+        int initialHistoryIndex = m_historyIndex;
+        bool foundMatch = false;
+        while(m_historyIndex >= 0 && m_historyIndex < m_history.size()) {
+            if (m_history.at(m_historyIndex).startsWith(m_currentTypedText, Qt::CaseInsensitive)) {
+                m_inputEdit->setText(m_history.at(m_historyIndex));
+                foundMatch = true;
+                break;
+            }
+            if (goUp) m_historyIndex--; else m_historyIndex++;
         }
-    } else { // Go down
-        if (m_historyIndex < m_history.size() - 1) {
-            m_historyIndex++;
+        if (!foundMatch) { // No match in the direction, revert index and potentially show m_currentTypedText
+            m_historyIndex = initialHistoryIndex; // Stay on previous match or boundary
+            // If we went past boundaries and found no match, going "down" further should bring back currentTypedText
+            if (!goUp && m_historyIndex >= m_history.size() -1 ) {
+                 // If user was at last item or beyond and pressed down, show their original text
+                m_inputEdit->setText(m_currentTypedText);
+                m_historyIndex = -1; // Back to "not navigating history" state
+            }
+             // if going up and hit start with no match, stay on first possible match or m_currentTypedText if no matches at all
+            else if (goUp && m_historyIndex < 0) {
+                m_inputEdit->setText(m_currentTypedText);
+                m_historyIndex = -1;
+            }
+            // else, if already navigating, stay on the current item if no further match.
+            // This part needs careful UX consideration to match original JMC.
+            // For now, if no match, it just stops searching in that direction.
+        }
+    } else { // No mask, simple navigation
+        if (m_historyIndex >= 0 && m_historyIndex < m_history.size()) {
             m_inputEdit->setText(m_history.at(m_historyIndex));
-        } else if (m_historyIndex == m_history.size() - 1) {
-            // Reached end of history, restore originally typed text or clear
-            m_historyIndex = -1; // Or m_history.size() to allow going up again
-            m_inputEdit->clear(); // Or restore m_currentTypedText
+        } else if (m_historyIndex < 0) { // Went past the beginning (UP)
+            m_historyIndex = -1; // Stay at "current line"
+            m_inputEdit->setText(m_currentTypedText); // Show original typed text
+        } else { // Went past the end (DOWN)
+            m_historyIndex = -1; // Back to "current line" state
+            m_inputEdit->setText(m_currentTypedText); // Show original typed text (or clear if preferred)
         }
     }
+
     if (m_cursorAtEndForHistoryRecall) {
         m_inputEdit->setCursorPosition(m_inputEdit->text().length());
     } else {
          m_inputEdit->setCursorPosition(0);
     }
-    m_isCompleting = false;
+    m_isCompleting = false; // Cancel tab completion when navigating history
 }
 
 void InputBarWidget::handleTabCompletion()
